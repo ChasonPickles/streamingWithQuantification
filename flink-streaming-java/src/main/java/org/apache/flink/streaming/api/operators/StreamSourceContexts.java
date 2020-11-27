@@ -27,12 +27,22 @@ import org.apache.flink.streaming.runtime.tasks.ProcessingTimeCallback;
 import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
 import org.apache.flink.util.Preconditions;
 
+import org.apache.flink.streaming.api.operators.aion.WindowSSlack;
+import org.apache.flink.streaming.api.operators.aion.WindowSSlackManager;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.concurrent.ScheduledFuture;
 
 /**
  * Source contexts for various stream time characteristics.
  */
 public class StreamSourceContexts {
+
+	protected static final Logger LOG = LoggerFactory.getLogger(StreamSourceContexts.class);
+
+	private static final long WINDOW_LENGTH = 3000;
+	private static final long SS_LENGTH = 300;
 
 	/**
 	 * Depending on the {@link TimeCharacteristic}, this method will return the adequate
@@ -55,9 +65,14 @@ public class StreamSourceContexts {
 		final SourceFunction.SourceContext<OUT> ctx;
 		switch (timeCharacteristic) {
 			case EventTime:
-				ctx = new ManualWatermarkContext<>(
+				ctx = new AionWatermarkContext<>(
 					output,
 					processingTimeService,
+					new WindowSSlackManager(
+						processingTimeService,
+						WINDOW_LENGTH,
+						SS_LENGTH,
+						(int) Math.ceil(WINDOW_LENGTH / (SS_LENGTH * 1.0))),
 					checkpointLock,
 					streamStatusMaintainer,
 					idleTimeout);
@@ -271,6 +286,80 @@ public class StreamSourceContexts {
 				nextWatermarkTimer = this.timeService.registerTimer(
 						nextWatermark, new WatermarkEmittingTask(this.timeService, lock, output));
 			}
+		}
+	}
+
+	/**
+	 * {@link SourceFunction.SourceContext} to be used for sources with adaptive delays for
+	 * watermark emission.
+	 */
+	private static class AionWatermarkContext<T> extends WatermarkContext<T> {
+
+		private final Output<StreamRecord<T>> output;
+		private final StreamRecord<T> reuse;
+
+		private final WindowSSlackManager windowSSlackManager;
+
+		private final static int MAX_TRIALS = 1;
+		private int trials = 0;
+
+		private AionWatermarkContext(
+			final Output<StreamRecord<T>> output,
+			final ProcessingTimeService timeService,
+			final WindowSSlackManager windowSSlackManager,
+			final Object checkpointLock,
+			final StreamStatusMaintainer streamStatusMaintainer,
+			final long idleTimeout) {
+			super(timeService, checkpointLock, streamStatusMaintainer, idleTimeout);
+
+			this.output = Preconditions.checkNotNull(output, "The output cannot be null.");
+			this.reuse = new StreamRecord<>(null);
+			this.windowSSlackManager = windowSSlackManager;
+		}
+
+		@Override
+		protected void processAndCollect(T element) {
+			throw new UnsupportedOperationException("Use processAndCollectWithTimestamp");
+		}
+
+		@Override
+		protected void processAndCollectWithTimestamp(T element, long timestamp) {
+			WindowSSlack window = windowSSlackManager.getWindowSlack(timestamp);
+			if (window.sample(timestamp)) {
+				output.collect(reuse.replace(element, timestamp));
+			}
+
+			trials++;
+			if (trials == MAX_TRIALS) {
+				long watTarget = window.emitWatermark();
+				if (watTarget != -1) {
+					Watermark watermark = new Watermark(watTarget);
+					output.emitWatermark(watermark);
+					windowSSlackManager.setLastEmittedWatermark(watTarget);
+					LOG.info("Emitted WT = {}", watermark);
+				}
+				trials = 0;
+			}
+
+		}
+
+		@Override
+		protected boolean allowWatermark(Watermark mark) {
+			return mark.getTimestamp() == Long.MAX_VALUE;
+		}
+
+		/**
+		 * This will only be called if allowWatermark returned {@code true}.
+		 */
+		@Override
+		protected void processAndEmitWatermark(Watermark mark) {
+			output.emitWatermark(mark);
+		}
+
+		@Override
+		public void close() {
+			super.close();
+			windowSSlackManager.printStats();
 		}
 	}
 
